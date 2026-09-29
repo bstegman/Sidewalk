@@ -1,0 +1,270 @@
+# DirectPeer Protocol (DPP) v0.1
+
+A computer-to-computer chat protocol. Messages exist only on the two endpoints and only while a live session is open. Intermediate machines, if any, may forward encrypted packets in memory. They must not persist chat content.
+
+## Design rules
+
+1. Identity is a keypair, not an account.
+2. Both peers must be online at the same time. There is no mailbox.
+3. Application data is end-to-end encrypted before it leaves the sender.
+4. Any helper (STUN, optional relay, bootstrap) must not store message payloads.
+5. Clients interoperate if they follow this document, regardless of language or UI.
+
+## 1. Identity
+
+Each user generates a long-term **Ed25519** identity keypair.
+
+- **Peer ID** = 32-byte Ed25519 public key, encoded as lowercase hex (64 chars).
+- Display name is local-only and optional. It is not an identifier.
+- Private key never leaves the device.
+
+Address string for sharing out of band:
+
+```text
+dpp:1:<peer-id-hex>
+```
+
+Optional connection hint after first contact:
+
+```text
+dpp:1:<peer-id-hex>@<ip>:<port>
+```
+
+Example:
+
+```text
+dpp:1:8f14e45fceea167a5a36dedd4bea2543d64883e634f0f86d1d16d1dd9a441f11
+```
+
+Users exchange this string in person, by QR, email, another app, etc. That is how contacts are added. There is no directory server.
+
+## 2. What â€œcomputer to computerâ€ means
+
+Preferred path:
+
+```text
+Client A  <---- encrypted TCP/QUIC/WebRTC ---->  Client B
+```
+
+Allowed helpers that do **not** store chat data:
+
+| Helper | Role | Persistence rule |
+|---|---|---|
+| STUN | Tell a peer its public IP:port | Must not see payloads |
+| Optional relay | Forward already-encrypted bytes when NAT blocks direct path | Memory only. Drop when the session ends. Never write payload to disk. |
+| Local discovery (mDNS) | Find peers on the same LAN | Local network only |
+
+Forbidden:
+
+- Storing undelivered messages on a server
+- Accounts, phone numbers, or a central user database
+- A server that can decrypt content
+
+Offline delivery is out of scope for v0.1. If B is offline, A cannot send. The client should show that clearly.
+
+## 3. Transport
+
+A client MUST support at least one of:
+
+1. **TCP** on a chosen port (default `4747`)
+2. **WebRTC data channel** (for browsers)
+3. **QUIC** (optional)
+
+All of them carry the same framed, encrypted application messages after handshake.
+
+NAT notes for implementers:
+
+- Try direct connect to a known `ip:port`.
+- Use STUN to learn a reflexive address and share it with the peer out of band or during an already-established session.
+- Attempt UDP/TCP hole punching if you implement it.
+- If direct connect fails, an optional relay may bounce **ciphertext only**. Relays are not part of the trust model.
+
+## 4. Security handshake
+
+Use the Noise protocol:
+
+```text
+Noise_XX_25519_ChaChaPoly_SHA256
+```
+
+Why XX: neither side needs the otherâ€™s static key before the handshake starts, both sides authenticate, and static keys are transmitted encrypted.
+
+Rules:
+
+- Each peer also has a **X25519** static key used only for Noise. Bind it to the Ed25519 identity (see handshake payload below).
+- After handshake, all further bytes are Noise transport messages (ChaCha20-Poly1305).
+- Rekey after 2^16 messages or 10 minutes, whichever comes first. Either side may send a `rekey` control message and start a new handshake on the same TCP/WebRTC connection, or open a new connection.
+- Abort if the remote Ed25519 identity does not match the Peer ID you intended to talk to.
+
+Handshake payload (inside Noise XX payloads, UTF-8 JSON):
+
+```json
+{
+  "proto": "dpp/0.1",
+  "peer_id": "<ed25519-hex>",
+  "noise_static": "<x25519-public-hex>",
+  "sig": "<ed25519-signature-hex>",
+  "name": "optional display name",
+  "features": ["text", "typing", "receipts"]
+}
+```
+
+`sig` is Ed25519 over the UTF-8 string:
+
+```text
+dpp/0.1|noise_static=<x25519-public-hex>
+```
+
+Receiver MUST verify `sig` with `peer_id`. If it fails, disconnect.
+
+## 5. Framing (after Noise)
+
+Noise already frames its own records. Inside decrypted transport plaintext, use this application frame:
+
+```text
+[uint32 BE length][uint8 type][payload]
+```
+
+- `length` = number of bytes after the length field (`1 + payload length`)
+- Max frame size: **65536** bytes. Larger messages are not allowed in v0.1 (no file transfer yet).
+- `type`:
+
+| type | name | payload |
+|---|---|---|
+| 0x01 | json | UTF-8 JSON object |
+| 0x02 | ping | empty |
+| 0x03 | pong | empty |
+| 0x04 | close | optional UTF-8 reason |
+
+Unknown types: ignore the frame, do not disconnect.
+
+Ping every 20s of silence. Close if no pong in 60s.
+
+## 6. Application JSON messages
+
+All chat semantics live in `type=0x01` frames.
+
+Common envelope:
+
+```json
+{
+  "v": 1,
+  "id": "<uuid-v4>",
+  "t": "<message-type>",
+  "ts": 1730000000000
+}
+```
+
+`ts` is milliseconds since Unix epoch on the senderâ€™s clock. Treat it as a hint, not truth.
+
+### 6.1 Chat text
+
+```json
+{
+  "v": 1,
+  "id": "b3c1e2a0-1c4a-4f0e-9c1a-0a1b2c3d4e5f",
+  "t": "msg",
+  "ts": 1730000000123,
+  "body": "hello",
+  "reply_to": null
+}
+```
+
+`body` is plain UTF-8 text. Max 8000 characters.
+
+### 6.2 Delivery / read receipts
+
+```json
+{ "v": 1, "id": "<new-uuid>", "t": "ack", "ts": 1730000000456, "ack_id": "<original-msg-id>", "state": "delivered" }
+```
+
+`state` is `delivered` or `read`. Receipts are optional. A client may omit them.
+
+### 6.3 Typing
+
+```json
+{ "v": 1, "id": "<uuid>", "t": "typing", "ts": 1730000000500, "on": true }
+```
+
+If `on` is true, the other client may show â€œtypingâ€¦â€ for 5 seconds or until `on: false`.
+
+### 6.4 Presence
+
+Sent once after handshake and on status change:
+
+```json
+{
+  "v": 1,
+  "id": "<uuid>",
+  "t": "hello",
+  "ts": 1730000000000,
+  "name": "Ada",
+  "status": "online"
+}
+```
+
+`status`: `online` or `away`.
+
+### 6.5 Error
+
+```json
+{ "v": 1, "id": "<uuid>", "t": "error", "ts": 1730000000600, "code": "too_large", "detail": "body exceeds 8000" }
+```
+
+## 7. Session lifecycle
+
+```text
+1. User pastes or scans a dpp: address
+2. Client resolves a candidate endpoint (hint, previous session, LAN mDNS, or user-entered IP)
+3. Open TCP / WebRTC / QUIC
+4. Noise XX handshake + identity verify
+5. Send hello
+6. Exchange msg / typing / ack frames
+7. Either side sends close, or timeout
+8. Wipe session keys from memory
+```
+
+Local history is allowed **on the userâ€™s own machine only**. The protocol does not sync history. If you store transcripts locally, encrypt them at rest with a key derived from the identity key or a user passphrase.
+
+## 8. Local discovery (optional but useful)
+
+On a LAN, advertise via mDNS:
+
+- Service type: `_dpp._tcp`
+- Port: listening port
+- TXT:
+  - `id=<peer-id-hex>`
+  - `ver=0.1`
+
+A client may auto-list nearby peers. Connecting still requires the user to accept the Peer ID (anti-spoof).
+
+## 9. Threat model (short)
+
+Protected:
+
+- Eavesdroppers on the network cannot read bodies.
+- A relay that only forwards Noise records cannot read bodies.
+- Impersonation of a known Peer ID without the private key.
+
+Not protected by v0.1:
+
+- Your IP is visible to the peer on a direct connection.
+- A global passive observer can see that two IPs are talking (metadata).
+- Compromise of a device exposes local history and keys.
+- First-contact Trust On First Use unless the user verifies the Peer ID out of band.
+
+If IP hiding matters later, run the same protocol over Tor or I2P. Do not add that to the core spec yet.
+
+## 10. Minimal viable client
+
+A first client is valid if it can:
+
+1. Generate and persist an identity keypair
+2. Show a `dpp:1:<peer-id>` address
+3. Listen on TCP 4747
+4. Dial another `ip:port`
+5. Complete Noise XX and verify Peer ID
+6. Send and display `msg` frames
+7. Refuse to send if not connected
+
+That is enough for two laptops on the same network or with one side port-forwarded.
