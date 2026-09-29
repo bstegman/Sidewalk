@@ -26,3 +26,4 @@ Requirements:
 - Keep the crypto and framing in a clear module so another client can interoperate.
 
 Follow this spec:
+https://github.com/bstegman/Sidewalk/blob/main/spec-v1.txt
