@@ -38,7 +38,7 @@ dpp:1:8f14e45fceea167a5a36dedd4bea2543d64883e634f0f86d1d16d1dd9a441f11
 
 Users exchange this string in person, by QR, email, another app, etc. That is how contacts are added. There is no directory server.
 
-## 2. What â€œcomputer to computerâ€ means
+## 2. What "computer to computer" means
 
 Preferred path:
 
@@ -72,6 +72,16 @@ A client MUST support at least one of:
 
 All of them carry the same framed, encrypted application messages after handshake.
 
+Noise handshake messages and Noise transport messages are not self-delimiting. On a byte stream (TCP, or a QUIC stream), send each one as its own record:
+
+```text
+uint32 BE length | Noise message
+```
+
+`length` is the number of Noise message bytes that follow. It does not include itself. Reject a length of 0, or a length greater than 65551 (65535 bytes of plaintext plus the 16-byte Poly1305 tag).
+
+On a carrier that already keeps message boundaries (one WebRTC data-channel message, or one QUIC datagram), send exactly one Noise message per carrier message and do not add this length prefix.
+
 NAT notes for implementers:
 
 - Try direct connect to a known `ip:port`.
@@ -87,16 +97,27 @@ Use the Noise protocol:
 Noise_XX_25519_ChaChaPoly_SHA256
 ```
 
-Why XX: neither side needs the otherâ€™s static key before the handshake starts, both sides authenticate, and static keys are transmitted encrypted.
+Why XX: neither side needs the other's static key before the handshake starts, both sides authenticate, and static keys are transmitted encrypted.
 
 Rules:
 
-- Each peer also has a **X25519** static key used only for Noise. Bind it to the Ed25519 identity (see handshake payload below).
-- After handshake, all further bytes are Noise transport messages (ChaCha20-Poly1305).
-- Rekey after 2^16 messages or 10 minutes, whichever comes first. Either side may send a `rekey` control message and start a new handshake on the same TCP/WebRTC connection, or open a new connection.
-- Abort if the remote Ed25519 identity does not match the Peer ID you intended to talk to.
+- The Noise prologue is empty. Do not mix in a protocol name or other prologue bytes. Two clients that choose different prologues cannot handshake.
+- Each peer also has a long-term **X25519** static key used only for Noise. Bind it to the Ed25519 identity (see handshake payload below).
+- Transport encryption uses that handshake's ChaCha20-Poly1305 keys. Associated data is empty.
+- Rekey after 2^16 transport messages in either direction, or 10 minutes, whichever comes first. See section 6.6.
+- Abort if the remote Ed25519 identity does not match the Peer ID you intended to talk to. Do this before sending `hello` or any chat.
 
-Handshake payload (inside Noise XX payloads, UTF-8 JSON):
+XX has three handshake messages. Put the identity JSON only in the messages that Noise encrypts:
+
+```text
+-> e                         payload empty
+<- e, ee, s, es              payload = identity JSON
+-> s, se                     payload = identity JSON
+```
+
+Message 1 must be an empty payload. If it is not, disconnect. Messages 2 and 3 must each carry the sender's identity JSON. If that payload is missing, disconnect.
+
+Handshake payload (UTF-8 JSON):
 
 ```json
 {
@@ -109,24 +130,30 @@ Handshake payload (inside Noise XX payloads, UTF-8 JSON):
 }
 ```
 
-`sig` is Ed25519 over the UTF-8 string:
+`peer_id`, `noise_static`, and `sig` are lowercase hex. `noise_static` is the 32-byte X25519 public key used as this peer's Noise static key in this handshake. `sig` is the 64-byte Ed25519 signature over the exact UTF-8 string:
 
 ```text
 dpp/0.1|noise_static=<x25519-public-hex>
 ```
 
-Receiver MUST verify `sig` with `peer_id`. If it fails, disconnect.
+The receiver MUST:
+
+1. Verify `sig` with the Ed25519 key in `peer_id`.
+2. Check that `noise_static` is the remote static key just received in the Noise `s` token. A signature over some other X25519 key is a failure.
+3. If this connection was opened toward a particular `dpp:1:` address, check that `peer_id` is that address. Any other Peer ID is a failure.
+
+On any failure, disconnect. Do not send chat. `name` is optional; omit it when empty, and keep it to 64 characters. `features` is optional. JSON object key order does not matter. The signature covers only the string above, not the JSON.
 
 ## 5. Framing (after Noise)
 
-Noise already frames its own records. Inside decrypted transport plaintext, use this application frame:
+Each decrypted Noise transport plaintext is exactly one application frame. Do not concatenate frames in one plaintext.
 
 ```text
 [uint32 BE length][uint8 type][payload]
 ```
 
 - `length` = number of bytes after the length field (`1 + payload length`)
-- Max frame size: **65536** bytes. Larger messages are not allowed in v0.1 (no file transfer yet).
+- The whole frame, including the 4-byte length, MUST fit in one Noise transport message. Noise limits that plaintext to **65535** bytes, so a frame of 65536 bytes is not valid. Larger messages are not allowed in v0.1 (no file transfer yet).
 - `type`:
 
 | type | name | payload |
@@ -136,9 +163,9 @@ Noise already frames its own records. Inside decrypted transport plaintext, use 
 | 0x03 | pong | empty |
 | 0x04 | close | optional UTF-8 reason |
 
-Unknown types: ignore the frame, do not disconnect.
+Unknown types: ignore the frame, do not disconnect. A malformed JSON payload is the same: ignore that frame, do not disconnect. A failed Noise authentication means the session is broken: disconnect.
 
-Ping every 20s of silence. Close if no pong in 60s.
+Ping every 20 seconds during which no frame has been received. Any received frame, including `pong`, shows the peer is still there. Close if no frame has been received for 60 seconds.
 
 ## 6. Application JSON messages
 
@@ -155,7 +182,7 @@ Common envelope:
 }
 ```
 
-`ts` is milliseconds since Unix epoch on the senderâ€™s clock. Treat it as a hint, not truth.
+`ts` is milliseconds since Unix epoch on the sender's clock. Treat it as a hint, not truth.
 
 ### 6.1 Chat text
 
@@ -170,7 +197,9 @@ Common envelope:
 }
 ```
 
-`body` is plain UTF-8 text. Max 8000 characters.
+`body` is plain text. Max 8000 Unicode characters (code points), not 8000 bytes. If a `msg` is longer, do not display it. Reply with an `error` frame, `code` `too_large`, and stay connected.
+
+Unknown `t` values are ignored. Do not disconnect.
 
 ### 6.2 Delivery / read receipts
 
@@ -186,7 +215,7 @@ Common envelope:
 { "v": 1, "id": "<uuid>", "t": "typing", "ts": 1730000000500, "on": true }
 ```
 
-If `on` is true, the other client may show â€œtypingâ€¦â€ for 5 seconds or until `on: false`.
+If `on` is true, the other client may show "typing..." for 5 seconds or until `on: false`.
 
 ### 6.4 Presence
 
@@ -211,6 +240,18 @@ Sent once after handshake and on status change:
 { "v": 1, "id": "<uuid>", "t": "error", "ts": 1730000000600, "code": "too_large", "detail": "body exceeds 8000" }
 ```
 
+### 6.6 Rekey
+
+Either side may rekey. Send this as a normal `0x01` frame, then immediately start a new `Noise_XX_25519_ChaChaPoly_SHA256` handshake on the same connection. The sender of `rekey` is the initiator. The receiver is the responder. Use the same long-term static keys and the same identity payload rules as section 4. Chat keys change only after that handshake finishes. Wipe the previous transport keys.
+
+```json
+{ "v": 1, "id": "<uuid>", "t": "rekey", "ts": 1730000000700 }
+```
+
+Messages already encrypted under the old keys may still be in flight. Read the next record and try the old transport key first. If authentication fails, that record is the next handshake message, not a broken chat frame.
+
+The peer with the lexicographically smaller `peer_id` SHOULD be the one that starts a rekey when the 10-minute timer fires, or when it sees the other side approach 2^16 transport messages. A peer MUST rekey before it sends a transport message at nonce 2^16. Both sides MUST accept a `rekey` from the other. Opening a fresh connection instead of rekeying on the same one is also allowed.
+
 ## 7. Session lifecycle
 
 ```text
@@ -224,7 +265,7 @@ Sent once after handshake and on status change:
 8. Wipe session keys from memory
 ```
 
-Local history is allowed **on the userâ€™s own machine only**. The protocol does not sync history. If you store transcripts locally, encrypt them at rest with a key derived from the identity key or a user passphrase.
+Local history is allowed **on the user's own machine only**. The protocol does not sync history. If you store transcripts locally, encrypt them at rest with a key derived from the identity key or a user passphrase.
 
 ## 8. Local discovery (optional but useful)
 

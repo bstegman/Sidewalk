@@ -1,5 +1,8 @@
 # Sidewalk
-The idea is a protocol people can tell AI to build a chat app around that talks directly to each others computer.  No data stored on someone elses server.  And you (AI) built the app so you don't have to worry about hidden code.  You also can create your own UI.
+
+A protocol people can hand to an AI to build a chat app that talks directly from one computer to another. No accounts. No mailbox. Nothing stored on someone else's server. You build the client, so you can read what it does, and you choose the UI.
+
+This repository is the specification only: [spec-v1.txt](spec-v1.txt). It does not contain a client. Build yours from the prompt below. Two clients interoperate when they follow the spec, including the TCP record framing, the empty Noise prologue, and which handshake message carries the identity.
 
 
 ## 11. Prompt you can give an AI to build a client
@@ -24,6 +27,7 @@ Requirements:
 - No intermediate server. Do not store messages anywhere except locally.
 - If the peer is offline, do not queue to a server. Show "peer offline".
 - Keep the crypto and framing in a clear module so another client can interoperate.
+- Implement the spec's TCP record framing, empty Noise prologue, and handshake payload placement exactly. Do not invent a different framing.
 
 Follow this spec:
 https://github.com/bstegman/Sidewalk/blob/main/spec-v1.txt
